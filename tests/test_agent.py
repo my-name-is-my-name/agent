@@ -65,7 +65,10 @@ class FakeTools:
         if name == "Synthesis":
             return {"proposed_scope": [{"text": "Рассмотреть анализ повреждения", "evidence_ids": ["E1"]}], "questions": ["Уточните применимость исходных данных."]}
         if name == "Followup":
-            return {"kind": "question" if "?" in data["message"] else "correction"}
+            message = data["message"].casefold()
+            if message == "коррозия rib5":
+                return {"kind": "ambiguous"}
+            return {"kind": "question" if "?" in message else "correction"}
         raise AssertionError(name)
 
     def search(self, text, profile, user_id):
@@ -255,6 +258,81 @@ def test_followup_does_not_overwrite_request(service):
     correction = result(run(service, "Добавлено повреждение второй панели", "m3"))
     assert "второй панели" in correction["state"]["request"]
     assert service.tools.calls.count("search") == 2
+
+
+def test_explicit_new_request_is_not_merged_or_searched(service):
+    first = result(run(service))
+    followup = result(run(service, "это другая заявка: трещина frame 42", "m2"))
+    assert followup["followup_kind"] == "new_request"
+    assert followup["state"]["request"] == first["state"]["request"]
+    assert "frame 42" not in followup["state"]["request"]
+    assert service.tools.calls.count("search") == 1
+    assert "отдельную заявку" in followup["content"]
+
+
+def test_explicit_correction_is_merged_and_researched(service):
+    run(service)
+    followup = result(run(service, "добавь: повреждение также затрагивает stringer 12", "m2"))
+    assert followup["followup_kind"] == "correction"
+    assert "stringer 12" in followup["state"]["request"]
+    assert service.tools.calls.count("search") == 2
+
+
+def test_candidate_question_uses_saved_state_when_documents_unresolved(service, monkeypatch):
+    def search(text, profile, user_id):
+        service.tools.calls.append("search")
+        return {
+            "status": "ok", "similarity_status": "qualified_matches_found",
+            "accepted": [
+                {"case_id": case_id, "qualified": True, "score": score,
+                 "similarity_reason_class": "same_work_type", "reasons": ["Совпадает вид работы"]}
+                for case_id, score in (("MP-0776", 0.9), ("MP-0632.1", 0.8), ("MP-1061", 0.7))
+            ],
+            "not_accepted": [],
+        }
+    monkeypatch.setattr(service.tools, "search", search)
+    service.tools.unresolved = True
+    run(service)
+    followup = result(run(service, "а какие аналоги ты нашел?", "m2"))
+    assert followup["followup_kind"] == "question"
+    assert service.tools.calls.count("search") == 1
+    assert all(case_id in followup["content"] for case_id in ("MP-0776", "MP-0632.1", "MP-1061"))
+    assert "case_mapping_unresolved" in followup["content"]
+    assert "техническая применимость не подтверждена" in followup["content"]
+    assert "Недостаточно данных в изученных источниках" not in followup["content"]
+
+
+def test_ambiguous_engineering_message_does_not_modify_request(service):
+    first = result(run(service))
+    followup = result(run(service, "коррозия rib5", "m2"))
+    assert followup["followup_kind"] == "ambiguous"
+    assert followup["state"]["request"] == first["state"]["request"]
+    assert service.tools.calls.count("search") == 1
+    assert "или это отдельная заявка?" in followup["content"]
+
+
+def test_document_question_uses_saved_state_without_research(service):
+    run(service)
+    followup = result(run(service, "Какие документы были изучены?", "m2"))
+    assert followup["followup_kind"] == "question"
+    assert service.tools.calls.count("search") == 1
+    assert "DOC-1" in followup["content"]
+
+
+def test_followup_routing_survives_service_restart(settings):
+    first_service = Service(settings, FakeTools(), start_worker=False)
+    try:
+        first = result(run(first_service))
+    finally:
+        first_service.close()
+    second_service = Service(settings, FakeTools(), start_worker=False)
+    try:
+        followup = result(run(second_service, "это другая заявка: трещина frame 42", "m2"))
+        assert followup["followup_kind"] == "new_request"
+        assert followup["state"]["request"] == first["state"]["request"]
+        assert "search" not in second_service.tools.calls
+    finally:
+        second_service.close()
 
 
 def test_weak_candidates_never_fill_output():

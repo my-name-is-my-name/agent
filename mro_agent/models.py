@@ -41,7 +41,7 @@ class Synthesis(StrictModel):
 
 
 class Followup(StrictModel):
-    kind: Literal["question", "correction"]
+    kind: Literal["question", "correction", "new_request", "ambiguous"]
 
 
 class ChatMessage(BaseModel):
@@ -63,4 +63,3 @@ class AssessmentRequest(StrictModel):
     chat_id: str = Field(min_length=1, max_length=200)
     message_id: str = Field(min_length=1, max_length=200)
     attachments_present: bool = False
-
