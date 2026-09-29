@@ -1,0 +1,21 @@
+services:
+  mro-assessment-agent:
+    build: .
+    env_file: .env
+    ports:
+      - "127.0.0.1:3003:8140"
+    volumes:
+      - agent-runtime:/app/runtime
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - intranet
+volumes:
+  agent-runtime:
+networks:
+  intranet:
+    external: true
+    name: intranet-rag_default
