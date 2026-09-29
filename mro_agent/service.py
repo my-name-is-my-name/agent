@@ -1,6 +1,5 @@
 import fcntl
 import json
-import re
 import sqlite3
 import threading
 
@@ -12,16 +11,6 @@ from .clients import ToolError, Tools
 from .models import Extraction, Followup, Verdict
 from .storage import Store
 from .workflow import Workflow, plain, render
-
-
-NEW_REQUEST_MARKERS = (
-    "это другая заявка", "новая заявка", "отдельная заявка", "другой кейс",
-    "следующая заявка", "this is another request", "new request",
-    "separate request", "different case",
-)
-CORRECTION_MARKERS = (
-    "добавь", "дополнение", "уточнение", "исправление", "также затрагивает",
-)
 
 
 class Service:
@@ -97,19 +86,27 @@ class Service:
                         self.answer_question(job, values, request_text)
                         return
                     if kind == "new_request":
+                        if values.get("pending_followup"):
+                            graph.update_state(config, {"pending_followup": None})
+                            values = dict(graph.get_state(config).values)
                         self.finish_routing_response(
                             job, values, kind,
                             "Это сообщение описывает отдельную заявку. Начните новую оценку в новом чате или контексте; текущая заявка не изменена.",
                         )
                         return
                     if kind == "ambiguous":
+                        pending = values.get("pending_followup") or request_text
+                        if not values.get("pending_followup"):
+                            graph.update_state(config, {"pending_followup": pending})
+                            values = dict(graph.get_state(config).values)
                         current = self.current_assessment_label(values)
                         self.finish_routing_response(
                             job, values, kind,
-                            f"«{plain(request_text[:240])}» относится к текущей заявке {current} или это отдельная заявка?",
+                            f"«{plain(pending[:240])}» относится к текущей заявке {current} или это отдельная заявка?",
                         )
                         return
-                    request_text = values["request"] + "\nДополнение пользователя: " + request_text
+                    addition = values.get("pending_followup") or request_text
+                    request_text = values["request"] + "\nДополнение пользователя: " + addition
                     if len(request_text) > 48000:
                         raise ToolError("request_history_limit")
                 initial = {
@@ -117,6 +114,7 @@ class Service:
                     "profile": {}, "questions": [], "rounds": 0, "candidates": [], "selected": [],
                     "evidence": [], "claims": [], "proposal": {}, "warnings": [], "content": "",
                     "status": "researching", "attachments_present": payload["attachments_present"],
+                    "pending_followup": None,
                 }
                 graph.invoke(initial, config)
             snapshot = graph.get_state(config)
@@ -138,11 +136,6 @@ class Service:
             self.fail(job, "internal_error")
 
     def classify_followup(self, state, message):
-        normalized = re.sub(r"\s+", " ", message.casefold()).strip()
-        if any(marker in normalized for marker in NEW_REQUEST_MARKERS):
-            return "new_request"
-        if any(marker in normalized for marker in CORRECTION_MARKERS):
-            return "correction"
         intent = self.tools.llm(
             "Классифицируй новое сообщение в существующей MRO-оценке. "
             "question — вопрос о текущей оценке или уже полученных результатах; "
@@ -150,8 +143,13 @@ class Service:
             "new_request — пользователь явно обозначает другую/новую заявку либо описывает явно отдельный инженерный случай; "
             "ambiguous — небезопасно определять, относится ли инженерное сообщение к текущей заявке. "
             "Разные дефекты, места, детали или ВС нельзя объединять только потому, что сообщения находятся в одном чате. "
+            "Если pending_followup задан, message — ответ пользователя на вопрос о принадлежности pending_followup: "
+            "верни correction при подтверждении текущей заявки и new_request при подтверждении отдельной заявки. "
             "При сомнении выбирай ambiguous. Не считай короткий инженерный фрагмент correction без явной связи с текущей заявкой.",
-            {"request": state.get("request"), "profile": state.get("profile", {}), "message": message},
+            {
+                "request": state.get("request"), "profile": state.get("profile", {}),
+                "message": message, "pending_followup": state.get("pending_followup"),
+            },
             Followup,
         )
         return intent["kind"]
@@ -175,13 +173,7 @@ class Service:
 
     def answer_question(self, job, state, question):
         self.store.event(job["id"], "question", "started", "Отвечаю по сохранённому состоянию оценки; исходные данные заявки не изменяю.")
-        normalized = question.casefold()
-        if any(word in normalized for word in ("аналог", "кандидат", "similar case", "candidate")):
-            content = self.candidates_answer(state)
-        elif any(word in normalized for word in ("документ", "источник", "document", "source")):
-            content = self.documents_answer(state)
-        else:
-            content = self.grounded_state_answer(state, question)
+        content = self.grounded_state_answer(state, question)
         if json.loads(job["payload"]).get("attachments_present"):
             content += "\n\nВложения не прочитаны: версия 0.1 отвечает только по тексту и ранее изученным источникам."
         self.store.event(job["id"], "question", "completed", "Ответ по сохранённым материалам подготовлен.")
@@ -193,6 +185,7 @@ class Service:
             "profile": state.get("profile", {}), "candidates": state.get("candidates", []),
             "selected": state.get("selected", []), "proposal": state.get("proposal", {}),
             "warnings": state.get("warnings", []),
+            "evidence": [{key: value for key, value in item.items() if key != "text"} for item in state.get("evidence", [])],
         }
         for key, value in structured.items():
             sources.append({"id": "STATE-" + key, "text": json.dumps(value, ensure_ascii=False, sort_keys=True)})
@@ -214,59 +207,11 @@ class Service:
                     verdict = self.tools.llm("Подтверждается ли утверждение цитатой с учётом контекста?", {"claim": claim, "context": source["text"]}, Verdict)
                     if verdict["supported"]:
                         lines.append(f"- {plain(claim['text'])} [{claim['evidence_id']}]. Цитата: «{plain(claim['quote'])}»")
+        if state.get("candidates"):
+            lines.append("- Найденные поиском кандидаты сами по себе не подтверждают техническую применимость.")
+            if not state.get("evidence"):
+                lines.append("- Документы кандидатов не были успешно прочитаны; техническая применимость не подтверждена.")
         return "Ответ по сохранённым материалам:\n\n" + ("\n".join(lines) if lines else "Недостаточно данных в сохранённом состоянии оценки.")
-
-    def candidates_answer(self, state):
-        candidates = state.get("candidates", [])
-        if not candidates:
-            return "В сохранённом состоянии оценки аналоги не найдены."
-        selected_ids = {str(item.get("case_id")) for item in state.get("selected", [])}
-        lines = ["Найдены кандидаты по результатам поиска похожих заявок (это ещё не подтверждает техническую применимость):"]
-        for candidate in candidates:
-            case_id = plain(str(candidate.get("case_id", "без ID")))
-            group = plain(str(candidate.get("group", "не указана")))
-            reasons = candidate.get("reasons") or []
-            reason = "; ".join(plain(str(item)) for item in reasons) or plain(str(candidate.get("similarity_reason_class") or "причина не указана"))
-            status = "выбран для чтения" if str(candidate.get("case_id")) in selected_ids else "не выбран для чтения"
-            lines.append(f"- {case_id}: группа {group}; {reason}; {status}.")
-        limitations = self.read_limitations(state)
-        if limitations:
-            lines.append("Документы кандидатов прочитаны не полностью или не прочитаны: " + "; ".join(limitations) + ". Поэтому техническая применимость не подтверждена.")
-        elif not state.get("evidence"):
-            lines.append("По кандидатам нет прочитанных документов, поэтому техническая применимость не подтверждена.")
-        return "\n".join(lines)
-
-    def documents_answer(self, state):
-        evidence = state.get("evidence", [])
-        documents = {}
-        for item in evidence:
-            did = str(item.get("document_id") or "без ID")
-            documents.setdefault(did, {"title": item.get("title"), "case_id": item.get("case_id")})
-        if documents:
-            lines = ["В сохранённой оценке изучены документы:"]
-            for did, item in documents.items():
-                title = plain(str(item.get("title") or did))
-                lines.append(f"- {plain(did)} — {title}; кандидат {plain(str(item.get('case_id') or 'не указан'))}.")
-        else:
-            lines = ["В сохранённой оценке нет успешно прочитанных документов."]
-        limitations = self.read_limitations(state)
-        if limitations:
-            lines.append("Ограничения чтения: " + "; ".join(limitations) + ".")
-        return "\n".join(lines)
-
-    @staticmethod
-    def read_limitations(state):
-        markers = ("case_mapping_unresolved", "document_case_mismatch", "документ", "прочитан", "текст", "фрагмент")
-        limitations = []
-        for warning in state.get("warnings", []):
-            raw = str(warning)
-            if not any(marker in raw.casefold() for marker in markers):
-                continue
-            rendered = plain(raw)
-            for code in ("case_mapping_unresolved", "document_case_mismatch"):
-                rendered = rendered.replace(code.replace("_", r"\_"), f"`{code}`")
-            limitations.append(rendered)
-        return limitations
 
     def fail(self, job, code):
         self.store.event(job["id"], "error", "error", "Оценка не завершена: " + code)

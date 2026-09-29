@@ -50,6 +50,9 @@ class FakeTools:
         self.long = False
         self.mismatch = False
         self.closed = False
+        self.followup_kind = "correction"
+        self.answer_claims = None
+        self.followup_inputs = []
 
     def llm(self, prompt, data, schema):
         name = schema.__name__
@@ -58,6 +61,8 @@ class FakeTools:
             enough = "панели" in data["request"]
             return {"object": "панель" if enough else "", "task": "анализ повреждения", "expected_result": "отчёт", "identifiers": [], "questions": [] if enough else ["Укажите объект работ."]}
         if name == "Extraction":
+            if "question" in data and self.answer_claims is not None:
+                return {"claims": self.answer_claims}
             source = data.get("source") or data.get("sources", [{}])[0]
             return {"claims": [{"text": "Выполнен анализ повреждения", "quote": "Выдуманная цитата" if self.bad_claim else "Выполнен анализ повреждения.", "evidence_id": source.get("id", "E1"), "category": "work"}]}
         if name == "Verdict":
@@ -65,10 +70,8 @@ class FakeTools:
         if name == "Synthesis":
             return {"proposed_scope": [{"text": "Рассмотреть анализ повреждения", "evidence_ids": ["E1"]}], "questions": ["Уточните применимость исходных данных."]}
         if name == "Followup":
-            message = data["message"].casefold()
-            if message == "коррозия rib5":
-                return {"kind": "ambiguous"}
-            return {"kind": "question" if "?" in message else "correction"}
+            self.followup_inputs.append(data)
+            return {"kind": self.followup_kind}
         raise AssertionError(name)
 
     def search(self, text, profile, user_id):
@@ -252,16 +255,19 @@ def test_users_and_chats_isolated(service):
 
 def test_followup_does_not_overwrite_request(service):
     first = result(run(service))
+    service.tools.followup_kind = "question"
     question = result(run(service, "Какие работы выполнены?", "m2"))
     assert question["state"]["request"] == first["state"]["request"]
     assert service.tools.calls.count("search") == 1
+    service.tools.followup_kind = "correction"
     correction = result(run(service, "Добавлено повреждение второй панели", "m3"))
     assert "второй панели" in correction["state"]["request"]
     assert service.tools.calls.count("search") == 2
 
 
-def test_explicit_new_request_is_not_merged_or_searched(service):
+def test_new_request_is_not_merged_or_searched(service):
     first = result(run(service))
+    service.tools.followup_kind = "new_request"
     followup = result(run(service, "это другая заявка: трещина frame 42", "m2"))
     assert followup["followup_kind"] == "new_request"
     assert followup["state"]["request"] == first["state"]["request"]
@@ -270,8 +276,9 @@ def test_explicit_new_request_is_not_merged_or_searched(service):
     assert "отдельную заявку" in followup["content"]
 
 
-def test_explicit_correction_is_merged_and_researched(service):
+def test_correction_is_merged_and_researched(service):
     run(service)
+    service.tools.followup_kind = "correction"
     followup = result(run(service, "добавь: повреждение также затрагивает stringer 12", "m2"))
     assert followup["followup_kind"] == "correction"
     assert "stringer 12" in followup["state"]["request"]
@@ -293,44 +300,93 @@ def test_candidate_question_uses_saved_state_when_documents_unresolved(service, 
     monkeypatch.setattr(service.tools, "search", search)
     service.tools.unresolved = True
     run(service)
+    service.tools.followup_kind = "question"
+    service.tools.answer_claims = [
+        {"text": f"Кандидат {case_id}: accepted; совпадает вид работы.", "quote": case_id,
+         "evidence_id": "STATE-candidates", "category": "context"}
+        for case_id in ("MP-0776", "MP-0632.1", "MP-1061")
+    ] + [{
+        "text": "Документы кандидатов не удалось разрешить и прочитать.",
+        "quote": "case_mapping_unresolved", "evidence_id": "STATE-warnings", "category": "context",
+    }]
     followup = result(run(service, "а какие аналоги ты нашел?", "m2"))
     assert followup["followup_kind"] == "question"
     assert service.tools.calls.count("search") == 1
     assert all(case_id in followup["content"] for case_id in ("MP-0776", "MP-0632.1", "MP-1061"))
-    assert "case_mapping_unresolved" in followup["content"]
+    assert "не удалось разрешить и прочитать" in followup["content"]
     assert "техническая применимость не подтверждена" in followup["content"]
     assert "Недостаточно данных в изученных источниках" not in followup["content"]
 
 
 def test_ambiguous_engineering_message_does_not_modify_request(service):
     first = result(run(service))
+    service.tools.followup_kind = "ambiguous"
     followup = result(run(service, "коррозия rib5", "m2"))
     assert followup["followup_kind"] == "ambiguous"
     assert followup["state"]["request"] == first["state"]["request"]
+    assert followup["state"]["pending_followup"] == "коррозия rib5"
     assert service.tools.calls.count("search") == 1
     assert "или это отдельная заявка?" in followup["content"]
 
 
 def test_document_question_uses_saved_state_without_research(service):
     run(service)
+    service.tools.followup_kind = "question"
+    service.tools.answer_claims = [{
+        "text": "Изучен документ DOC-1.", "quote": "DOC-1",
+        "evidence_id": "STATE-evidence", "category": "context",
+    }]
     followup = result(run(service, "Какие документы были изучены?", "m2"))
     assert followup["followup_kind"] == "question"
     assert service.tools.calls.count("search") == 1
     assert "DOC-1" in followup["content"]
 
 
-def test_followup_routing_survives_service_restart(settings):
+def test_ambiguous_confirmation_appends_original_message(service):
+    first = result(run(service))
+    service.tools.followup_kind = "ambiguous"
+    run(service, "коррозия rib5", "m2")
+    service.tools.followup_kind = "correction"
+    confirmed = result(run(service, "да, к текущей", "m3"))
+    assert service.tools.followup_inputs[-1]["pending_followup"] == "коррозия rib5"
+    assert confirmed["followup_kind"] == "correction"
+    assert confirmed["state"]["request"] == first["state"]["request"] + "\nДополнение пользователя: коррозия rib5"
+    assert "да, к текущей" not in confirmed["state"]["request"]
+    assert confirmed["state"]["pending_followup"] is None
+    assert service.tools.calls.count("search") == 2
+
+
+def test_ambiguous_confirmation_separate_leaves_request_unchanged(service):
+    first = result(run(service))
+    service.tools.followup_kind = "ambiguous"
+    run(service, "коррозия rib5", "m2")
+    service.tools.followup_kind = "new_request"
+    separate = result(run(service, "это отдельная заявка", "m3"))
+    assert service.tools.followup_inputs[-1]["pending_followup"] == "коррозия rib5"
+    assert separate["followup_kind"] == "new_request"
+    assert separate["state"]["request"] == first["state"]["request"]
+    assert separate["state"]["pending_followup"] is None
+    assert service.tools.calls.count("search") == 1
+
+
+def test_pending_ambiguous_state_survives_service_restart(settings):
     first_service = Service(settings, FakeTools(), start_worker=False)
     try:
         first = result(run(first_service))
+        first_service.tools.followup_kind = "ambiguous"
+        pending = result(run(first_service, "коррозия rib5", "m2"))
+        assert pending["state"]["pending_followup"] == "коррозия rib5"
     finally:
         first_service.close()
-    second_service = Service(settings, FakeTools(), start_worker=False)
+    tools = FakeTools()
+    tools.followup_kind = "correction"
+    second_service = Service(settings, tools, start_worker=False)
     try:
-        followup = result(run(second_service, "это другая заявка: трещина frame 42", "m2"))
-        assert followup["followup_kind"] == "new_request"
-        assert followup["state"]["request"] == first["state"]["request"]
-        assert "search" not in second_service.tools.calls
+        followup = result(run(second_service, "да, к текущей", "m3"))
+        assert followup["followup_kind"] == "correction"
+        assert followup["state"]["request"] == first["state"]["request"] + "\nДополнение пользователя: коррозия rib5"
+        assert followup["state"]["pending_followup"] is None
+        assert second_service.tools.calls.count("search") == 1
     finally:
         second_service.close()
 

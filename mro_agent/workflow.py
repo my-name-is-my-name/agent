@@ -28,6 +28,7 @@ class State(TypedDict, total=False):
     content: str
     attachments_present: bool
     job_id: str
+    pending_followup: str | None
 
 
 def plain(value):
